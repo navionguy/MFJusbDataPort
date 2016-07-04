@@ -1,0 +1,183 @@
+;*******************************************************************************
+; MFJusbDataPort -- Screen Scrape MFJ-269 Display Data
+;
+
+	list      b=8,p=16F1826     ; list directive to define processor
+	#include <p16f1826.inc> ; processor specific variable definitions
+	errorlevel -302			; turn off banksel warning
+
+; Configure the processor as required
+
+	__CONFIG	_CONFIG1, _CP_OFF & _WDTE_OFF & _BOREN_OFF & _PWRTE_ON & _FOSC_INTOSC & _MCLRE_OFF & _CPD_OFF & _CLKOUTEN_OFF & _IESO_OFF & _FCMEN_OFF & 0x3fff
+	__CONFIG	_CONFIG2, _WRT_OFF & _PLLEN_ON & _STVREN_ON & _BORV_LO & _LVP_ON & 0x3fff
+
+	#include	"UsbDataPort.inc"	; Project specific data
+
+	extern	UARTInit, UART_RX, UART_TX, SendHexByte, SendByte, ReadByte
+
+;******************************************************************************
+
+;******************************************************************************
+;Reset Vector 
+;******************************************************************************
+		org		0x000         	; processor reset vector
+		nop						; required by in circuit debugger  
+		goto	Init            ; go to beginning of program
+
+;******************************************************************************
+;Interrupt Vector     
+;******************************************************************************
+		ORG	0x004
+		goto	StopWhatYoureDoing
+
+		page
+
+;******************************************************************************
+;General Purpose Registers (GPR's) 
+;******************************************************************************
+
+		udata
+
+w_temp		res	1				; used by my ISR
+status_temp	res	1
+int_bits	res 1				; interrupt flags to clear before ISR exits
+
+UsbPort	code
+
+;******************************************************************************
+;******************************************************************************
+;Initialization
+;******************************************************************************
+;******************************************************************************
+;Initialization
+;
+; Steps:
+;	1. Enable Port A as all digital inputs
+;	2. Enable the UART on Port B (see page 289 on the datasheet)
+;	3. Enable the RB5-RB7 as inputs
+;	4. Set an interrupt on RB7 changing (see page 134 off the datasheet)
+;******************************************************************************
+Init
+		BANKSEL	Bank1					; setup the internal oscillator
+
+		movlw	b'11110100' 			; 8Mhz, internal oscillator, PLL will push to 32Mhz (datasheet pg 67)
+		movwf	OSCCON
+
+
+		BANKSEL	Bank0					;select bank0
+		clrf	PORTA					;clear port bus
+		clrf	PORTB					;clear port bus
+	
+		BANKSEL	OPTION_REG				;use Bank1
+		clrf	OPTION_REG				;put w reg into option register
+	
+		movlw	PORTA_INPUTS
+		movwf	TRISA					; program PORTA
+	
+		movlw	PORTB_INPUTS			;load w reg with PORTB I/O (datasheet pg 126)
+		movwf	TRISB					;program PORTB
+										; datasheet pg 130
+	
+		BANKSEL	Bank2					; turn off alternate pin function (datasheet pg 118)
+		clrf	APFCON0					; puts RX_DATA on RB1 (datasheet pg 122)
+		clrf	APFCON1					; puts TX_DATA on RB2
+	
+		BANKSEL	Bank3					; turn off analog function (datasheet pg 122 & 128)
+		clrf	ANSELA
+		clrf	ANSELB
+	
+		BANKSEL	WPUA					; setup weak pull-up resistors, (datasheet pg 128)
+		clrf	WPUA					; no pull-ups on Display
+		clrf	WPUB					; no pull-ups here either
+	
+		BANKSEL	IOCBP					; configure LCD 'E' line tells me to read data
+		movlw	E_Line					; bit 0
+		movwf	IOCBP					; interrupt on going positive (datasheet pg 134)
+		movwf	IOCBN					; and on going negative
+	
+		BANKSEL	Bank0					;back to bank0
+		call	UARTInit				; let the UART routines get setup
+
+;end pic initialization
+		bsf		INTCON,GIE				; enable global interrupts
+		bsf		INTCON,IOCIE			; turn on the interrupt
+
+;*****************************************************************************
+;main program
+;
+; Add support for V0 brief data, V1 for verbose
+
+main_loop:
+		goto	main_loop				; if not state transisitions, just loop
+
+		page
+
+;******************************************************************************
+; StopWhatYoureDoing -- My Interrupt Handler
+;
+; Currently Implemented Interrupts:
+;
+;	RCIF - UART receive character interrupt
+;	TXIF - UART transmitter idle interrupt
+;	IOCBF - Radio power on bit has changed state
+;******************************************************************************
+
+StopWhatYoureDoing				; An interrupt has occured, I should do something about that.
+		BankSel INTCON
+		clrf	int_bits		; zero the flag byte
+		btfsc	PIR1,RCIF		; did I receive a character?
+		call	UART_RX
+	
+		BankSel	PIE1
+		btfss	PIE1,TXIE		; first, see if UART is sending
+		goto	NotSending		; nope, not his interrupt
+		BankSel	PIR1
+		btfsc	PIR1,TXIF		; did transmit just run out of data?
+		call	UART_TX
+
+NotSending:
+		BankSel	IOCBF			; see if LCD just got writtten too
+		btfss	IOCBF,E_Line_BIT; was interrupt generated by LCD write line?
+		goto	CheckRXData		; did UART receive data
+
+; data just clocked into LCD display, see if I care
+; I need to setup the interface routine to handle which ever one has occurred
+
+		BankSel	PORTB
+	
+		movfw	PORTB
+		andlw	LCD_RS			; clear bits I don't care about
+		ifdef	SendAsHex
+		call	SendHexByte
+		else
+		call	SendByte
+		endif
+
+		movfw	PORTA
+		ifdef	SendAsHex
+		call	SendHexByte
+		else
+		call	SendByte
+		endif
+
+; clear the E_Line intterupt
+		bsf		int_bits,E_Line_BIT
+
+; check to see if computer sent me data
+
+CheckRXData:
+		btfss	IOCBF,RX_DATA_BIT	; was interrupt generated by the UART?
+		goto	ExitInterrupt		; no, just leave
+
+CheckRXExit:
+		bsf		int_bits,RX_DATA_BIT; turn off just the RX_DATA interrupt flag
+
+ExitInterrupt:
+		movfw	int_bits
+		BankSel	IOCBF
+		xorwf	IOCBF,W
+		andwf	IOCBF,F
+
+		retfie
+
+	end
